@@ -55,11 +55,11 @@ class AVATARModel(ModelBase):
         self.decB64 = modelify(AVATARModel.DecFlow()) ( [ Input(K.int_shape(self.enc.outputs[0])[1:]) ] )
         self.D = modelify(AVATARModel.Discriminator() ) (Input(in_bgr_shape))     
         self.C = modelify(AVATARModel.ResNet (9, use_batch_norm=False, n_blocks=6, ngf=128, use_dropout=False))( Input(bgr_t_shape))
-           
+        self.CD = modelify(AVATARModel.CDiscriminator() ) (Input(bgr_t_shape))     
          
         if self.is_first_run():
             conv_weights_list = []
-            for model in [self.enc, self.decA64, self.decB64, self.C, self.D]:
+            for model in [self.enc, self.decA64, self.decB64, self.C, self.D, self.CD]:
                 for layer in model.layers:
                     if type(layer) == keras.layers.Conv2D:
                         conv_weights_list += [layer.weights[0]] #Conv2D kernel_weights
@@ -72,6 +72,7 @@ class AVATARModel(ModelBase):
                 [self.decB64, 'decB64.h5'],
                 [self.C, 'C.h5'],
                 [self.D, 'D.h5'],
+                [self.CD, 'CD.h5'],
             ]
             self.load_weights_safe(weights_to_load)
         
@@ -121,9 +122,9 @@ class AVATARModel(ModelBase):
             return K.spatial_2d_padding(x, padding=((pad, pad), (pad, pad)) ) + K.constant(a, dtype=K.floatx() )
             
         def Cto3t(x):
-            return Lambda ( lambda x: x[...,0:3], output_shape= ( K.int_shape(x)[1:3], 3 ) ) (x), \
-                   Lambda ( lambda x: x[...,3:6], output_shape= ( K.int_shape(x)[1:3], 3 ) ) (x), \
-                   Lambda ( lambda x: x[...,6:9], output_shape= ( K.int_shape(x)[1:3], 3 ) ) (x)
+            return Lambda ( lambda x: x[...,0:3], output_shape= K.int_shape(x)[1:3] + (3,) ) (x), \
+                   Lambda ( lambda x: x[...,3:6], output_shape= K.int_shape(x)[1:3] + (3,) ) (x), \
+                   Lambda ( lambda x: x[...,6:9], output_shape= K.int_shape(x)[1:3] + (3,) ) (x)
                    
         rec_AB_t0 = gray_pad( self.decA64 (self.enc (real_B64_t0)) )
         rec_AB_t1 = gray_pad( self.decA64 (self.enc (real_B64_t1)) )
@@ -135,6 +136,13 @@ class AVATARModel(ModelBase):
        
         rec_C_A_t0, rec_C_A_t1, rec_C_A_t2 = Cto3t ( self.C ( K.concatenate ( [C_in_A_t0, C_in_A_t1, C_in_A_t2] , axis=-1) ) )
         rec_C_AB_t0, rec_C_AB_t1, rec_C_AB_t2 = Cto3t( self.C ( K.concatenate ( [rec_AB_t0, rec_AB_t1, rec_AB_t2] , axis=-1) ) )
+        
+        real_A_t012_d = self.CD ( K.concatenate ( [real_A_t0, real_A_t1,real_A_t2], axis=-1)  )
+        real_A_t012_d_ones = K.ones_like(real_A_t012_d)
+
+        rec_C_AB_t012_d = self.CD ( K.concatenate ( [rec_C_AB_t0,rec_C_AB_t1, rec_C_AB_t2], axis=-1) )
+        rec_C_AB_t012_d_ones = K.ones_like(rec_C_AB_t012_d)
+        rec_C_AB_t012_d_zeros = K.zeros_like(rec_C_AB_t012_d)
 
         self.G64_view = K.function([warped_A64, warped_B64],[rec_A64, rec_B64, rec_AB64])
         self.G_view = K.function([real_A64_t0, real_A64m_t0, real_A64_t1, real_A64m_t1, real_A64_t2, real_A64m_t2, real_B64_t0, real_B64_t1, real_B64_t2], [rec_C_A_t0, rec_C_A_t1, rec_C_A_t2, rec_C_AB_t0, rec_C_AB_t1, rec_C_AB_t2])
@@ -147,21 +155,35 @@ class AVATARModel(ModelBase):
 
             loss_C = K.mean( 10 * dssim(kernel_size=int(resolution/11.6),max_value=1.0) ( real_A_t0, rec_C_A_t0 ) ) + \
                      K.mean( 10 * dssim(kernel_size=int(resolution/11.6),max_value=1.0) ( real_A_t1, rec_C_A_t1 ) ) + \
-                     K.mean( 10 * dssim(kernel_size=int(resolution/11.6),max_value=1.0) ( real_A_t2, rec_C_A_t2 ) ) #+ DLoss(fake_A_d_ones, fake_A_d )
+                     K.mean( 10 * dssim(kernel_size=int(resolution/11.6),max_value=1.0) ( real_A_t2, rec_C_A_t2 ) ) + \
+                     0.1*DLoss(rec_C_AB_t012_d_ones, rec_C_AB_t012_d )
+                     
             weights_C = self.C.trainable_weights
             
             loss_D = (DLoss(real_A64_d_ones, real_A64_d ) + \
-                        DLoss(fake_A64_d_zeros, fake_A64_d ) ) * 0.5
+                      DLoss(fake_A64_d_zeros, fake_A64_d ) ) * 0.5
                       
+            loss_CD = ( DLoss(real_A_t012_d_ones, real_A_t012_d) + \
+                        DLoss(rec_C_AB_t012_d_zeros, rec_C_AB_t012_d) ) * 0.5
+                         
+            weights_CD = self.CD.trainable_weights
+            
             def opt(lr=5e-5):
                 return Adam(lr=lr, beta_1=0.5, beta_2=0.999, tf_cpu_mode=2 if 'tensorflow' in self.device_config.backend else 0 )
 
             self.AB64_train = K.function ([warped_A64, real_A64, real_A64m, warped_B64, real_B64, real_B64m], [loss_AB64], opt().get_updates(loss_AB64, weights_AB64) )
             self.C_train = K.function ([real_A64_t0, real_A64m_t0, real_A_t0,
                                         real_A64_t1, real_A64m_t1, real_A_t1, 
-                                        real_A64_t2, real_A64m_t2, real_A_t2],[ loss_C ], opt().get_updates(loss_C, weights_C) )
+                                        real_A64_t2, real_A64m_t2, real_A_t2,
+                                        real_B64_t0, real_B64_t1,  real_B64_t2],[ loss_C ], opt().get_updates(loss_C, weights_C) )
            
             self.D_train = K.function ([warped_A64, real_A64, real_A64m, warped_B64, real_B64, real_B64m],[loss_D], opt().get_updates(loss_D, self.D.trainable_weights) )
+            
+            
+            self.CD_train = K.function ([real_A64_t0, real_A64m_t0, real_A_t0,
+                                         real_A64_t1, real_A64m_t1, real_A_t1, 
+                                         real_A64_t2, real_A64m_t2, real_A_t2,
+                                         real_B64_t0, real_B64_t1,  real_B64_t2 ],[ loss_CD ], opt().get_updates(loss_CD, weights_CD) )
             
             ###########
             t = SampleProcessor.Types
@@ -214,6 +236,7 @@ class AVATARModel(ModelBase):
                     [self.decB64, 'decB64.h5'],
                     [self.C, 'C.h5'],
                     [self.D, 'D.h5'],
+                    [self.CD, 'CD.h5'],
                ]
         
     #override
@@ -223,6 +246,7 @@ class AVATARModel(ModelBase):
                                     [self.decB64, 'decB64.h5'],
                                     [self.C, 'C.h5'],
                                     [self.D, 'D.h5'],
+                                    [self.CD, 'CD.h5'],
                                  ])
 
     #override
@@ -237,16 +261,29 @@ class AVATARModel(ModelBase):
             loss,   = self.AB64_train ( [warped_src64, src64, src64m, warped_dst64, dst64, dst64m] ) 
             loss_D, = self.D_train  ( [warped_src64, src64, src64m, warped_dst64, dst64, dst64m] )
             if self.stage != 0:
-                loss_C = 0
+                loss_C = loss_CD = 0
             
         if self.stage == 0 or self.stage == 2:
-            loss_C1, = self.C_train ( [real_A64_t0, real_A64m_t0, real_A_t0, real_A64_t1, real_A64m_t1, real_A_t1, real_A64_t2, real_A64m_t2, real_A_t2] )
-            loss_C2, = self.C_train ( [real_A64_t2, real_A64m_t2, real_A_t2, real_A64_t1, real_A64m_t1, real_A_t1, real_A64_t0, real_A64m_t0, real_A_t0] )
+            loss_C1, = self.C_train ( [real_A64_t0, real_A64m_t0, real_A_t0, 
+                                       real_A64_t1, real_A64m_t1, real_A_t1, 
+                                       real_A64_t2, real_A64m_t2, real_A_t2,
+                                       real_B64_t0, real_B64_t1, real_B64_t2] )
+                                       
+            loss_C2, = self.C_train ( [real_A64_t2, real_A64m_t2, real_A_t2, 
+                                       real_A64_t1, real_A64m_t1, real_A_t1, 
+                                       real_A64_t0, real_A64m_t0, real_A_t0,
+                                       real_B64_t0, real_B64_t1, real_B64_t2] )
+                                       
+            loss_CD, = self.CD_train ( [real_A64_t0, real_A64m_t0, real_A_t0, 
+                                        real_A64_t1, real_A64m_t1, real_A_t1, 
+                                        real_A64_t2, real_A64m_t2, real_A_t2,
+                                        real_B64_t0, real_B64_t1, real_B64_t2] )
+            
             loss_C = (loss_C1 + loss_C2) / 2
             if self.stage != 0:
-                loss, loss_D = 0, 0
+                loss = loss_D = 0
         
-        return ( ('loss', loss), ('D', loss_D), ('C', loss_C) )
+        return ( ('loss', loss), ('D', loss_D), ('C', loss_C), ('CD', loss_CD) )
 
     #override
     def onGetPreview(self, sample):
@@ -426,7 +463,43 @@ class AVATARModel(ModelBase):
             
             return XConv2D( 1, 4, strides=1, padding='same', use_bias=True, activation='sigmoid')(x)#
         return func
-    
+        
+    @staticmethod
+    def CDiscriminator(ndf=256):
+        exec (nnlib.import_all(), locals(), globals())
+
+        use_bias = True
+        def XNormalization(x):
+            return InstanceNormalization (axis=-1)(x)
+        #use_bias = False
+        #def XNormalization(x):
+        #    return BatchNormalization (axis=-1)(x)
+
+        XConv2D = partial(Conv2D, use_bias=use_bias)
+
+        def func(input):
+            b,h,w,c = K.int_shape(input)
+
+            x = input
+
+            x = XConv2D( ndf, 4, strides=2, padding='same', use_bias=True)(x)
+            x = LeakyReLU(0.2)(x)
+
+            x = XConv2D( ndf*2, 4, strides=2, padding='same')(x)
+            x = XNormalization(x)
+            x = LeakyReLU(0.2)(x)
+
+            x = XConv2D( ndf*4, 4, strides=2, padding='same')(x)
+            x = XNormalization(x)
+            x = LeakyReLU(0.2)(x)
+            
+            #x = XConv2D( ndf*8, 4, strides=2, padding='same')(x)
+            #x = XNormalization(x)
+            #x = LeakyReLU(0.2)(x)
+            
+            return XConv2D( 1, 4, strides=1, padding='same', use_bias=True, activation='sigmoid')(x)#
+        return func
+        
     @staticmethod
     def EncFlow(padding='zero', **kwargs):
         exec (nnlib.import_all(), locals(), globals())
